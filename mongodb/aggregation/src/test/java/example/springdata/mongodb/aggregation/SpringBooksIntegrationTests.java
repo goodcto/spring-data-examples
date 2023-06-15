@@ -34,6 +34,7 @@ import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.annotation.Id;
 import org.springframework.data.domain.Sort.Direction;
 import org.springframework.data.mongodb.core.MongoOperations;
+import org.springframework.data.mongodb.core.aggregation.Aggregation;
 import org.springframework.data.mongodb.core.aggregation.ArithmeticOperators;
 import org.springframework.data.mongodb.core.aggregation.ArrayOperators;
 import org.springframework.data.mongodb.core.aggregation.BucketAutoOperation.Granularities;
@@ -64,7 +65,8 @@ class SpringBooksIntegrationTests {
 
 	@DynamicPropertySource
 	static void setProperties(DynamicPropertyRegistry registry) {
-		registry.add("spring.data.mongodb.uri", mongoDBContainer::getReplicaSetUrl);
+		// 通过docker启动 registry.add("spring.data.mongodb.uri", mongoDBContainer::getReplicaSetUrl);
+		registry.add("spring.data.mongodb.uri", ()->"mongodb://localhost:27017/test");
 	}
 
 	@Autowired MongoOperations operations;
@@ -93,12 +95,14 @@ class SpringBooksIntegrationTests {
 		record BookTitle(String title) {
 		}
 
-		var aggregation = newAggregation( //
-				sort(Direction.ASC, "volumeInfo.title"), //
+		var aggregation = Aggregation.newAggregation(
+				// - sort()：根据"volumeInfo.title"字段按升序对文档进行排序。
+				sort(Direction.ASC, "volumeInfo.title"),
+				// - project()：仅在输出中包括"volumeInfo.title"字段，并将其重命名为"title"。
 				project().and("volumeInfo.title").as("title"));
 
+		// 使用MongoDB操作的aggregate()方法执行聚合管道。该方法接受三个参数：聚合管道、要执行聚合的集合的名称（"books"），以及映射结果的类（BookTitle.class）。
 		var result = operations.aggregate(aggregation, "books", BookTitle.class);
-
 		assertThat(result.getMappedResults())//
 				.extracting("title")//
 				.containsSequence("Aprende a Desarrollar con Spring Framework", "Beginning Spring", "Beginning Spring 2");
@@ -106,21 +110,26 @@ class SpringBooksIntegrationTests {
 
 	/**
 	 * Get number of books that were published by the particular publisher.
+	 * 根据 volumeInfo.publisher 分组 count
 	 */
 	@Test
 	void shouldRetrieveBooksPerPublisher() {
-
-		var aggregation = newAggregation( //
-				group("volumeInfo.publisher") //
-						.count().as("count"), //
-				sort(Direction.DESC, "count"), //
+		record BooksPerPublisherCount(String publisher, int count) {
+		}
+		var aggregation = newAggregation(
+				group("volumeInfo.publisher") //  按"volumeInfo.publisher"字段分组。
+						.count().as("count"), // 计算每个出版商的书籍数量
+				sort(Direction.DESC, "count"), // 按照count倒叙
 				project("count").and("_id").as("publisher"));
 
-		var result = operations.aggregate(aggregation, "books", BooksPerPublisher.class);
+		// 相当于 db.books.aggregate([{ "$group" : { "_id" : "$volumeInfo.publisher", "count" : { "$sum" : 1}}}, { "$sort" : { "count" : -1}}, { "$project" : { "count" : 1, "publisher" : "$_id"}}])
+		System.out.println(aggregation);
+		var result = operations.aggregate(aggregation, "books", BooksPerPublisherCount.class);
 
 		assertThat(result).hasSize(27);
 		assertThat(result).extracting("publisher").containsSequence("Apress", "Packt Publishing Ltd");
 		assertThat(result).extracting("count").containsSequence(26, 22, 11);
+
 	}
 
 	/**
@@ -132,7 +141,9 @@ class SpringBooksIntegrationTests {
 		var aggregation = newAggregation( //
 				group("volumeInfo.publisher") //
 						.count().as("count") //
-						.addToSet("volumeInfo.title").as("titles"), //
+						// addToSet: 将值加入一个数组中，会判断是否有重复的值，若相同的值在数组中已经存在了，则不加入。
+						// 如果不去重，则使用push
+						.push("volumeInfo.title").as("titles"), // 将每个出版商的书籍标题添加到一个集合中。
 				sort(Direction.DESC, "count"), //
 				project("count", "titles").and("_id").as("publisher"));
 
@@ -152,10 +163,12 @@ class SpringBooksIntegrationTests {
 	void shouldRetrieveDataRelatedBooks() {
 
 		var aggregation = newAggregation( //
+				// 包含data关键字的书籍，不区分大小写，如果区分大小写改成：.regex("data")
 				match(Criteria.where("volumeInfo.title").regex("data", "i")), //
-				replaceRoot("volumeInfo"), //
-				project("title", "authors"), //
+				replaceRoot("volumeInfo"), // 将每个匹配的书籍的"volumeInfo"字段作为根节点
+				project("title", "authors"), // 仅在输出中包括"title"和"authors"字段。
 				sort(Direction.ASC, "title"));
+		System.out.println(aggregation);
 
 		var result = operations.aggregate(aggregation, "books", BookAndAuthors.class);
 
@@ -168,6 +181,13 @@ class SpringBooksIntegrationTests {
 
 	/**
 	 * Retrieve the number of pages per author (and divide the number of pages by the number of authors).
+	 * 每个作者 书籍总页数
+	 * 如果一本书的作者有多个，则平摊
+	 * Josh Long 为例
+	 * 1. 828  4个人 - 828/4 = 207
+	 * 2. 664  4个人 - 664/4 = 166
+	 * 3. 400  2个人 - 400/2 = 200
+	 *    1892	- 573
 	 */
 	@Test
 	void shouldRetrievePagesPerAuthor() {
@@ -176,15 +196,15 @@ class SpringBooksIntegrationTests {
 		}
 
 		var aggregation = newAggregation( //
-				match(Criteria.where("volumeInfo.authors").exists(true)), //
-				replaceRoot("volumeInfo"), //
-				project("authors", "pageCount") //
-						.and(ArithmeticOperators.valueOf("pageCount") //
+				match(Criteria.where("volumeInfo.authors").exists(true)), // 过滤掉没有作者信息的书籍。
+				replaceRoot("volumeInfo"), // 将每个书籍的"volumeInfo"字段作为根节点。
+				project("authors", "pageCount") // 仅在输出中包括"authors"和"pageCount"字段
+						.and(ArithmeticOperators.valueOf("pageCount") // 计算每本书平摊到作者的页数
 								.divideBy(ArrayOperators.arrayOf("authors").length()))
 						.as("pagesPerAuthor"),
-				unwind("authors"), //
+				unwind("authors"), // 展开"authors"数组，以便每个作者都有自己的记录。
 				group("authors") //
-						.sum("pageCount").as("totalPageCount") //
+						.sum("pageCount").as("totalPageCount") // 总页数
 						.sum("pagesPerAuthor").as("approxWritten"), //
 				sort(Direction.DESC, "totalPageCount"));
 
